@@ -19,14 +19,19 @@ Code for "Steerable Scene Generation with Post Training and Inference-Time Searc
 If you find this work useful, please cite our paper:
 
 ```bibtex
-@misc{pfaff2025_steerable_scene_generation,
-    author        = {Pfaff, Nicholas and Dai, Hongkai and Zakharov, Sergey and Iwase, Shun and Tedrake, Russ},
-    title         = {Steerable Scene Generation with Post Training and Inference-Time Search},
-    year          = {2025},
-    eprint        = {2505.04831},
-    archivePrefix = {arXiv},
-    primaryClass  = {cs.RO},
-    url           = {https://arxiv.org/abs/2505.04831}, 
+@InProceedings{pfaff2025_steerable_scene_generation,
+  title = 	 {Steerable Scene Generation with Post Training and Inference-Time Search},
+  author =       {Pfaff, Nicholas Ezra and Dai, Hongkai and Zakharov, Sergey and Iwase, Shun and Tedrake, Russ},
+  booktitle = 	 {Proceedings of The 8th Conference on Robot Learning},
+  pages = 	 {1690--1702},
+  year = 	 {2025},
+  editor = 	 {Lim, Joseph and Song, Shuran and Park, Hae-Won},
+  volume = 	 {305},
+  series = 	 {Proceedings of Machine Learning Research},
+  month = 	 {27--30 Sep},
+  publisher =    {PMLR},
+  pdf = 	 {https://raw.githubusercontent.com/mlresearch/v305/main/assets/pfaff25a/pfaff25a.pdf},
+  url = 	 {https://proceedings.mlr.press/v305/pfaff25a.html},
 }
 ```
 
