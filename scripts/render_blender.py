@@ -18,6 +18,12 @@ from pysdf import SDF
 from scipy.spatial.transform import Rotation
 from urllib.parse import urlparse
 
+# NOTE: `bpy` is only available when this script is executed via `blenderproc run ...`
+try:
+    import bpy  # type: ignore
+except Exception:  # pragma: no cover
+    bpy = None
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 console_logger = logging.getLogger(__name__)
@@ -203,9 +209,124 @@ def load_sdf_into_blender(sdf_path: str, mesh_root: str = "./data") -> None:
                     obj.set_cp("mesh_file", mesh_uri)
 
 
+def _configure_cycles(
+    device: str,
+    compute_device_type: str,
+    gpu_indices: Optional[List[int]],
+    width: int,
+    height: int,
+    samples: int,
+) -> None:
+    """
+    Configure Cycles device selection and basic render settings.
+
+    Important: Cycles multi-GPU duplicates scene data on each enabled GPU. On shared nodes, if Blender
+    enables all GPUs and any one of them is low on free VRAM, you can get "System is out of GPU memory"
+    even if other GPUs have plenty of free memory.
+    """
+    if bpy is None:
+        console_logger.warning("`bpy` not available; cannot configure Cycles devices/settings.")
+        return
+
+    scene = bpy.context.scene
+
+    # Resolution affects per-frame buffers and can materially change memory usage.
+    scene.render.resolution_x = int(width)
+    scene.render.resolution_y = int(height)
+    scene.render.resolution_percentage = 100
+
+    # Samples affect runtime more than memory, but make it configurable.
+    if hasattr(scene, "cycles"):
+        scene.cycles.samples = int(samples)
+        # Persistent data can increase memory; safer default for batch runs.
+        if hasattr(scene.cycles, "use_persistent_data"):
+            scene.cycles.use_persistent_data = False
+
+    device = (device or "gpu").strip().lower()
+    if device == "cpu":
+        if hasattr(scene, "cycles"):
+            scene.cycles.device = "CPU"
+        console_logger.info("Cycles device set to CPU.")
+        return
+
+    # GPU path: configure Cycles addon prefs to use only selected GPUs.
+    try:
+        prefs = bpy.context.preferences
+        cycles_prefs = prefs.addons["cycles"].preferences
+    except Exception as e:  # pragma: no cover
+        console_logger.warning(f"Could not access Cycles addon preferences; leaving default device selection. ({e})")
+        if hasattr(scene, "cycles"):
+            scene.cycles.device = "GPU"
+        return
+
+    compute_device_type = (compute_device_type or "OPTIX").strip().upper()
+    try:
+        cycles_prefs.compute_device_type = compute_device_type
+    except Exception as e:
+        console_logger.warning(
+            f"Could not set Cycles compute_device_type={compute_device_type}; leaving default. ({e})"
+        )
+
+    # Populate device list
+    try:
+        cycles_prefs.get_devices()
+    except Exception:
+        pass
+
+    devices = list(getattr(cycles_prefs, "devices", []))
+    for d in devices:
+        try:
+            d.use = False
+        except Exception:
+            pass
+
+    enabled = 0
+    if gpu_indices:
+        for idx in gpu_indices:
+            if 0 <= idx < len(devices):
+                try:
+                    devices[idx].use = True
+                    enabled += 1
+                except Exception:
+                    pass
+            else:
+                console_logger.warning(
+                    f"Requested GPU index {idx} is out of range (0..{max(len(devices)-1, 0)})."
+                )
+    else:
+        # If user didn't specify indices, enable all GPUs (keeps existing behavior).
+        for d in devices:
+            if getattr(d, "type", "").upper() == "CPU":
+                continue
+            try:
+                d.use = True
+                enabled += 1
+            except Exception:
+                pass
+
+    if hasattr(scene, "cycles"):
+        scene.cycles.device = "GPU"
+
+    if gpu_indices:
+        console_logger.info(
+            f"Cycles device set to GPU ({compute_device_type}); enabled {enabled} device(s) from indices={gpu_indices}."
+        )
+    else:
+        console_logger.info(
+            f"Cycles device set to GPU ({compute_device_type}); enabled {enabled} device(s) (all GPUs)."
+        )
+
+
 # --- Main Pipeline ---
 
-def render_scene(sdf_path: str, output_dir: str, n_camera_poses: int = 2, mesh_root: str = "./data"):
+def render_scene(
+    sdf_path: str,
+    output_dir: str,
+    n_camera_poses: int = 2,
+    mesh_root: str = "./data",
+    width: int = 1200,
+    height: int = 1200,
+):
     """
     Orchestrates the rendering for a single SDF scene.
     """
@@ -213,7 +334,7 @@ def render_scene(sdf_path: str, output_dir: str, n_camera_poses: int = 2, mesh_r
     bproc.clean_up()
     
     # 1. Setup Camera & Light
-    camera_intrinsics = setup_cameras(n_poses=n_camera_poses)
+    camera_intrinsics = setup_cameras(n_poses=n_camera_poses, width=width, height=height)
     setup_lighting()
     
     # 2. Load Scene Geometry
@@ -255,11 +376,49 @@ def main():
         default="./data",
         help="Root directory containing asset packages referenced by package:// URIs (e.g. <mesh_root>/gazebo, <mesh_root>/tri).",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Cycles render device. Use 'cpu' to avoid GPU OOM on shared nodes (slower).",
+    )
+    parser.add_argument(
+        "--compute_device_type",
+        type=str,
+        default="OPTIX",
+        help="Cycles compute device type (e.g. OPTIX, CUDA). Only used when --device gpu.",
+    )
+    parser.add_argument(
+        "--gpu_indices",
+        type=str,
+        default="6",
+        help="Comma-separated GPU indices to enable inside Blender (e.g. '6' or '0,1'). "
+             "If empty, enables all GPUs (default behavior).",
+    )
+    parser.add_argument("--width", type=int, default=1200, help="Render width in pixels.")
+    parser.add_argument("--height", type=int, default=1200, help="Render height in pixels.")
+    parser.add_argument("--samples", type=int, default=32, help="Cycles samples per pixel.")
     
     args = parser.parse_args()
     
     # Initialize BlenderProc (run once)
     bproc.init()
+    gpu_indices: Optional[List[int]] = None
+    if args.gpu_indices.strip():
+        try:
+            gpu_indices = [int(x.strip()) for x in args.gpu_indices.split(",") if x.strip() != ""]
+        except ValueError:
+            raise ValueError(f"Invalid --gpu_indices='{args.gpu_indices}'. Expected comma-separated integers.")
+
+    _configure_cycles(
+        device=args.device,
+        compute_device_type=args.compute_device_type,
+        gpu_indices=gpu_indices,
+        width=args.width,
+        height=args.height,
+        samples=args.samples,
+    )
     bproc.renderer.enable_depth_output(activate_antialiasing=False)
     bproc.renderer.enable_normals_output()
     
@@ -278,7 +437,14 @@ def main():
         scene_name = os.path.splitext(sdf_file)[0]
         scene_output_dir = os.path.join(args.output_folder, scene_name)
         
-        render_scene(sdf_path, scene_output_dir, n_camera_poses=1, mesh_root=args.mesh_root)
+        render_scene(
+            sdf_path,
+            scene_output_dir,
+            n_camera_poses=1,
+            mesh_root=args.mesh_root,
+            width=args.width,
+            height=args.height,
+        )
 
 
 if __name__ == "__main__":
