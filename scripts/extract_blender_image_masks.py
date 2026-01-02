@@ -20,6 +20,7 @@ import h5py
 import numpy as np
 import torch
 from PIL import Image
+from plyfile import PlyData, PlyElement
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -97,7 +98,9 @@ class HDF5Extractor:
         return {
             "hdf5_path": self.hdf5_path,
             "image": image_tensor,           # (3, H, W)
+            "color_image": color_image,      # (H, W, 3) uint8 - for PLY colors
             "intrinsics": intrinsics,        # (3, 3)
+            "all_points": all_points,        # (H, W, 3) - full scene pointmap
             "object_points": object_points,  # (N, H, W, 3)
             "object_masks": object_masks,    # (N, H, W)
             "instance_ids": instance_ids,    # (N,)
@@ -149,8 +152,79 @@ class HDF5Extractor:
         
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=4)
+
+        # 4. Save Pointmap as NPZ and PLY
+        self._save_pointmap(data, output_dir)
         
         console_logger.info("Extraction complete.")
+
+    def _save_pointmap(self, data: Dict[str, Any], output_dir: str):
+        """
+        Save the full scene pointmap as NPZ (for loading) and PLY (for visualization).
+        """
+        all_points = data['all_points']       # (H, W, 3)
+        color_image = data['color_image']     # (H, W, 3) uint8
+        intrinsics = data['intrinsics'].numpy()  # (3, 3)
+
+        # Save NPZ with pointmap and intrinsics
+        npz_path = os.path.join(output_dir, "pointmap.npz")
+        np.savez(
+            npz_path,
+            pointmap=all_points,      # (H, W, 3)
+            intrinsics=intrinsics     # (3, 3)
+        )
+        console_logger.info(f"Saved pointmap NPZ: {npz_path}")
+
+        # Save PLY for visualization
+        ply_path = os.path.join(output_dir, "pointmap.ply")
+        self._save_pointmap_as_ply(all_points, color_image, ply_path)
+        console_logger.info(f"Saved pointmap PLY: {ply_path}")
+
+    def _save_pointmap_as_ply(
+        self, 
+        points: np.ndarray, 
+        colors: np.ndarray, 
+        ply_path: str
+    ):
+        """
+        Save pointmap as PLY file with RGB colors.
+        
+        Args:
+            points: (H, W, 3) pointmap
+            colors: (H, W, 3) RGB colors (uint8)
+            ply_path: output PLY file path
+        """
+        # Flatten to (N, 3)
+        points_flat = points.reshape(-1, 3)
+        colors_flat = colors.reshape(-1, 3)
+
+        # Filter valid points (non-zero depth, finite values)
+        valid_mask = (
+            (np.linalg.norm(points_flat, axis=1) > 1e-6) &
+            np.isfinite(points_flat).all(axis=1)
+        )
+        
+        valid_points = points_flat[valid_mask]
+        valid_colors = colors_flat[valid_mask]
+
+        console_logger.info(f"PLY: {valid_points.shape[0]} valid points out of {points_flat.shape[0]}")
+
+        # Create structured array for PLY
+        dtype = [
+            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
+        ]
+        vertices = np.empty(valid_points.shape[0], dtype=dtype)
+        vertices['x'] = valid_points[:, 0]
+        vertices['y'] = valid_points[:, 1]
+        vertices['z'] = valid_points[:, 2]
+        vertices['red'] = valid_colors[:, 0]
+        vertices['green'] = valid_colors[:, 1]
+        vertices['blue'] = valid_colors[:, 2]
+
+        # Write PLY
+        el = PlyElement.describe(vertices, 'vertex')
+        PlyData([el]).write(ply_path)
 
 
 def _output_dir_for_hdf5(hdf5_path: str) -> str:
